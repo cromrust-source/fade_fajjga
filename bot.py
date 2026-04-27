@@ -4,6 +4,7 @@ import sqlite3
 import random
 from datetime import datetime, timedelta
 from typing import Dict, Optional, List, Tuple
+import aiohttp
 
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command, StateFilter
@@ -12,13 +13,16 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
-    ContentType
+    ReplyKeyboardMarkup, KeyboardButton, InputMediaPhoto
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.exceptions import TelegramBadRequest
 
 # ------------------ КОНФИГ ------------------
-BOT_TOKEN = "8756968212:AAGdxXZpt8wkLnCpd02aLI043IHoyJbqt38"   # замените на токен от @BotFather
-ADMIN_IDS = [8732825022]             # ваш Telegram ID
+BOT_TOKEN = "8756968212:AAGdxXZpt8wkLnCpd02aLI043IHoyJbqt38"   # замените
+ADMIN_IDS = [8732825022]             # ваш ID
+
+REQUIRED_CHANNEL = "@Scam_officiali"
 
 PAYMENT_DETAILS = {
     "card": "2200700538676841",
@@ -41,7 +45,6 @@ def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     
-    # Таблица users
     c.execute('''CREATE TABLE IF NOT EXISTS users (
         user_id INTEGER PRIMARY KEY,
         username TEXT,
@@ -51,15 +54,17 @@ def init_db():
         banned INTEGER DEFAULT 0,
         payment_id TEXT UNIQUE,
         daily_bonus_last INTEGER DEFAULT 0,
+        referrer_id INTEGER DEFAULT 0,
+        referrals_count INTEGER DEFAULT 0,
         lang TEXT DEFAULT 'ru'
     )''')
     
-    # Добавляем недостающие колонки (без ошибок)
     c.execute("PRAGMA table_info(users)")
     existing = [col[1] for col in c.fetchall()]
     for col, col_type in [("balance", "INTEGER DEFAULT 4"), ("is_premium", "INTEGER DEFAULT 0"),
                           ("premium_until", "INTEGER DEFAULT 0"), ("banned", "INTEGER DEFAULT 0"),
                           ("payment_id", "TEXT UNIQUE"), ("daily_bonus_last", "INTEGER DEFAULT 0"),
+                          ("referrer_id", "INTEGER DEFAULT 0"), ("referrals_count", "INTEGER DEFAULT 0"),
                           ("lang", "TEXT DEFAULT 'ru'")]:
         if col not in existing:
             if col == "payment_id":
@@ -68,24 +73,39 @@ def init_db():
             else:
                 c.execute(f"ALTER TABLE users ADD COLUMN {col} {col_type}")
     
-    # Таблица videos
-    c.execute('''CREATE TABLE IF NOT EXISTS videos (
+    c.execute('''CREATE TABLE IF NOT EXISTS contents (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT,
         file_id TEXT,
-        is_vip INTEGER DEFAULT 0,
-        category TEXT DEFAULT 'life'
+        media_type TEXT DEFAULT 'video',
+        is_vip INTEGER DEFAULT 0
     )''')
+    c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='videos'")
+    if c.fetchone():
+        c.execute("INSERT INTO contents (name, file_id, is_vip) SELECT name, file_id, is_vip FROM videos")
+        c.execute("DROP TABLE videos")
     
-    # Таблица purchases
-    c.execute('''CREATE TABLE IF NOT EXISTS purchases (
-        user_id INTEGER,
-        video_id INTEGER,
-        timestamp INTEGER,
-        PRIMARY KEY (user_id, video_id)
-    )''')
+    # Исправление таблицы purchases
+    c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='purchases'")
+    if c.fetchone():
+        c.execute("PRAGMA table_info(purchases)")
+        cols = [col[1] for col in c.fetchall()]
+        if 'content_id' not in cols:
+            c.execute("DROP TABLE purchases")
+            c.execute('''CREATE TABLE purchases (
+                user_id INTEGER,
+                content_id INTEGER,
+                timestamp INTEGER,
+                PRIMARY KEY (user_id, content_id)
+            )''')
+    else:
+        c.execute('''CREATE TABLE purchases (
+            user_id INTEGER,
+            content_id INTEGER,
+            timestamp INTEGER,
+            PRIMARY KEY (user_id, content_id)
+        )''')
     
-    # Таблица promocodes
     c.execute('''CREATE TABLE IF NOT EXISTS promocodes (
         code TEXT PRIMARY KEY,
         reward INTEGER,
@@ -97,37 +117,54 @@ def init_db():
         code TEXT,
         PRIMARY KEY (user_id, code)
     )''')
-    
-    # Таблица логов алмазов
     c.execute('''CREATE TABLE IF NOT EXISTS diamond_logs (
         user_id INTEGER,
         amount INTEGER,
         reason TEXT,
         timestamp INTEGER
     )''')
-    
-    # Таблица заявок на оплату (без diamonds, теперь сумма в amount_rub и тип)
     c.execute('''CREATE TABLE IF NOT EXISTS pending_payments (
         user_id INTEGER,
         payment_id TEXT,
         amount_rub INTEGER,
-        type TEXT,   -- 'diamonds' или 'premium'
+        type TEXT,
         diamonds INTEGER DEFAULT 0,
         timestamp INTEGER,
         status TEXT DEFAULT 'pending'
     )''')
-    # Проверяем наличие колонки diamonds
-    c.execute("PRAGMA table_info(pending_payments)")
-    pending_cols = [col[1] for col in c.fetchall()]
-    if "diamonds" not in pending_cols:
-        c.execute("ALTER TABLE pending_payments ADD COLUMN diamonds INTEGER DEFAULT 0")
-    if "status" not in pending_cols:
-        c.execute("ALTER TABLE pending_payments ADD COLUMN status TEXT DEFAULT 'pending'")
+    c.execute('''CREATE TABLE IF NOT EXISTS tiktok_tasks (
+        user_id INTEGER PRIMARY KEY,
+        last_completed INTEGER DEFAULT 0
+    )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS user_tokens (
+        user_id INTEGER,
+        token TEXT,
+        submitted_at INTEGER,
+        bot_username TEXT,
+        PRIMARY KEY (user_id, token)
+    )''')
+    c.execute("PRAGMA table_info(user_tokens)")
+    token_cols = [col[1] for col in c.fetchall()]
+    if "bot_username" not in token_cols:
+        c.execute("ALTER TABLE user_tokens ADD COLUMN bot_username TEXT")
+    
+    c.execute('''CREATE TABLE IF NOT EXISTS token_stats (
+        user_id INTEGER PRIMARY KEY,
+        last_reset INTEGER DEFAULT 0,
+        count_this_period INTEGER DEFAULT 0
+    )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS support_messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        message TEXT,
+        created_at INTEGER,
+        status TEXT DEFAULT 'pending'
+    )''')
     
     conn.commit()
     conn.close()
     
-    # Генерация payment_id для старых пользователей
+    # payment_id для старых пользователей
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("SELECT user_id FROM users WHERE payment_id IS NULL")
@@ -149,14 +186,15 @@ init_db()
 def get_user(user_id: int) -> Optional[Dict]:
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("SELECT user_id, username, balance, is_premium, premium_until, banned, payment_id, daily_bonus_last, lang FROM users WHERE user_id = ?", (user_id,))
+    c.execute("SELECT user_id, username, balance, is_premium, premium_until, banned, payment_id, daily_bonus_last, referrer_id, referrals_count FROM users WHERE user_id = ?", (user_id,))
     row = c.fetchone()
     conn.close()
     if row:
         return {
             "user_id": row[0], "username": row[1], "balance": row[2],
             "is_premium": row[3], "premium_until": row[4], "banned": row[5],
-            "payment_id": row[6], "daily_bonus_last": row[7], "lang": row[8]
+            "payment_id": row[6], "daily_bonus_last": row[7],
+            "referrer_id": row[8], "referrals_count": row[9]
         }
     return None
 
@@ -169,15 +207,6 @@ def generate_unique_payment_id() -> str:
         if not c.fetchone():
             conn.close()
             return new_id
-        # повторяем
-
-def create_user(user_id: int, username: str):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    payment_id = generate_unique_payment_id()
-    c.execute("INSERT OR IGNORE INTO users (user_id, username, payment_id) VALUES (?, ?, ?)", (user_id, username, payment_id))
-    conn.commit()
-    conn.close()
 
 def update_balance(user_id: int, delta: int):
     conn = sqlite3.connect(DB_PATH)
@@ -201,44 +230,62 @@ def set_ban(user_id: int, banned: bool):
     conn.commit()
     conn.close()
 
-def get_all_videos(vip_only=False) -> List[Dict]:
+def get_all_content(media_type=None, vip_only=False) -> List[Dict]:
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
+    query = "SELECT id, name, file_id, media_type, is_vip FROM contents WHERE 1=1"
+    params = []
+    if media_type:
+        query += " AND media_type = ?"
+        params.append(media_type)
     if vip_only:
-        c.execute("SELECT id, name, file_id FROM videos WHERE is_vip = 1")
-    else:
-        c.execute("SELECT id, name, file_id FROM videos")
+        query += " AND is_vip = 1"
+    c.execute(query, params)
     rows = c.fetchall()
     conn.close()
-    return [{"id": r[0], "name": r[1], "file_id": r[2]} for r in rows]
+    return [{"id": r[0], "name": r[1], "file_id": r[2], "media_type": r[3], "is_vip": r[4]} for r in rows]
 
-def get_random_video() -> Optional[Dict]:
-    """Возвращает случайное обычное (не VIP) видео"""
-    videos = get_all_videos(vip_only=False)
-    if not videos:
+def get_random_content(media_type='video') -> Optional[Dict]:
+    items = get_all_content(media_type=media_type, vip_only=False)
+    if not items:
         return None
-    return random.choice(videos)
+    return random.choice(items)
 
-def add_video(name: str, file_id: str, is_vip: int = 0):
+def add_content(file_id: str, media_type: str, is_vip: int = 0):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("INSERT INTO videos (name, file_id, is_vip) VALUES (?, ?, ?)", (name, file_id, is_vip))
+    c.execute("SELECT COUNT(*) FROM contents WHERE media_type = ?", (media_type,))
+    count = c.fetchone()[0] + 1
+    name = f"{'Видео' if media_type=='video' else 'Фото'} #{count}"
+    c.execute("INSERT INTO contents (name, file_id, media_type, is_vip) VALUES (?, ?, ?, ?)", (name, file_id, media_type, is_vip))
     conn.commit()
     conn.close()
 
-def remove_video(video_id: int):
+def remove_content(content_id: int):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("DELETE FROM videos WHERE id = ?", (video_id,))
+    c.execute("DELETE FROM contents WHERE id = ?", (content_id,))
     conn.commit()
     conn.close()
 
-def add_purchase(user_id: int, video_id: int):
+def user_has_purchased(user_id: int, content_id: int) -> bool:
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("INSERT INTO purchases (user_id, video_id, timestamp) VALUES (?, ?, ?)", (user_id, video_id, int(datetime.now().timestamp())))
-    conn.commit()
+    c.execute("SELECT 1 FROM purchases WHERE user_id = ? AND content_id = ?", (user_id, content_id))
+    res = c.fetchone()
     conn.close()
+    return res is not None
+
+def add_purchase(user_id: int, content_id: int):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    try:
+        c.execute("INSERT INTO purchases (user_id, content_id, timestamp) VALUES (?, ?, ?)", (user_id, content_id, int(datetime.now().timestamp())))
+        conn.commit()
+    except sqlite3.IntegrityError:
+        pass
+    finally:
+        conn.close()
 
 def get_daily_bonus_last(user_id: int) -> int:
     conn = sqlite3.connect(DB_PATH)
@@ -256,6 +303,7 @@ def set_daily_bonus_last(user_id: int, timestamp: int):
     conn.close()
 
 def apply_promocode(user_id: int, code: str) -> Tuple[bool, int]:
+    code = code.strip().upper()
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("SELECT reward, max_uses, used_count FROM promocodes WHERE code = ?", (code,))
@@ -263,8 +311,8 @@ def apply_promocode(user_id: int, code: str) -> Tuple[bool, int]:
     if not row:
         conn.close()
         return False, 0
-    reward, max_uses, used_count = row
-    if max_uses > 0 and used_count >= max_uses:
+    reward, max_uses, used = row
+    if max_uses > 0 and used >= max_uses:
         conn.close()
         return False, 0
     c.execute("SELECT 1 FROM used_promocodes WHERE user_id = ? AND code = ?", (user_id, code))
@@ -289,14 +337,14 @@ def get_all_promocodes():
 def add_promocode(code: str, reward: int, max_uses: int):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("INSERT OR REPLACE INTO promocodes (code, reward, max_uses, used_count) VALUES (?, ?, ?, 0)", (code, reward, max_uses))
+    c.execute("INSERT OR REPLACE INTO promocodes (code, reward, max_uses, used_count) VALUES (?, ?, ?, 0)", (code.upper(), reward, max_uses))
     conn.commit()
     conn.close()
 
 def delete_promocode(code: str):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("DELETE FROM promocodes WHERE code = ?", (code,))
+    c.execute("DELETE FROM promocodes WHERE code = ?", (code.upper(),))
     conn.commit()
     conn.close()
 
@@ -304,51 +352,163 @@ def get_stats():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("SELECT COUNT(*) FROM users")
-    users = c.fetchone()[0]
-    c.execute("SELECT SUM(balance) FROM users")
-    total_balance = c.fetchone()[0] or 0
-    c.execute("SELECT COUNT(*) FROM videos")
-    videos = c.fetchone()[0]
-    c.execute("SELECT COUNT(*) FROM purchases")
-    purchases = c.fetchone()[0]
+    total_users = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM users WHERE banned = 1")
+    banned_users = c.fetchone()[0]
     now = int(datetime.now().timestamp())
     c.execute("SELECT COUNT(*) FROM users WHERE is_premium = 1 AND premium_until > ?", (now,))
     premium_users = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM contents WHERE media_type='video' AND is_vip=0")
+    videos = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM contents WHERE media_type='video' AND is_vip=1")
+    vip_videos = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM contents WHERE media_type='photo' AND is_vip=0")
+    photos = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM contents WHERE media_type='photo' AND is_vip=1")
+    vip_photos = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM pending_payments WHERE status='pending'")
+    pending_payments = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM tiktok_tasks")
+    tiktok_tasks = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM support_messages")
+    support_msgs = c.fetchone()[0]
     conn.close()
-    return users, total_balance, videos, purchases, premium_users
+    return total_users, banned_users, premium_users, videos, vip_videos, photos, vip_photos, pending_payments, tiktok_tasks, support_msgs
 
-# ------------------ КЛАВИАТУРЫ ------------------
-def get_main_keyboard(user_id: int) -> InlineKeyboardMarkup:
-    user = get_user(user_id)
-    if not user:
-        user = {"balance": 0, "is_premium": 0, "premium_until": 0, "username": "гость"}
-    premium_active = user['is_premium'] and user['premium_until'] > int(datetime.now().timestamp())
-    premium_status = "✅ ДА" if premium_active else "❌ НЕТ"
-    text = f"👋 ПРИВЕТ, {user['username'] or 'гость'}!\n\n🏠 ГЛАВНОЕ МЕНЮ\n\n💎 АЛМАЗЫ: {user['balance']}\n⭐ PREMIUM: {premium_status}\n\n📢 НАШ КАНАЛ: https://t.me/Radion_officiali\n👨‍💼 АДМИН: @scam_lil"
-    builder = InlineKeyboardBuilder()
-    builder.row(InlineKeyboardButton(text="🎬 СМОТРЕТЬ ВИДЕО", callback_data="watch_video"))
-    builder.row(InlineKeyboardButton(text="💎 КУПИТЬ АЛМАЗЫ", callback_data="buy_diamonds_menu"))
-    builder.row(InlineKeyboardButton(text="⭐ PREMIUM", callback_data="premium_menu"))
-    builder.row(InlineKeyboardButton(text="👤 ПРОФИЛЬ", callback_data="profile"))
-    builder.row(InlineKeyboardButton(text="🎫 ПРОМОКОД", callback_data="promocode"))
-    builder.row(InlineKeyboardButton(text="🎁 ЕЖЕДНЕВНЫЙ БОНУС", callback_data="daily_bonus"))
-    builder.row(InlineKeyboardButton(text="📞 ПОДДЕРЖКА", callback_data="support"))
+# ---------- ФУНКЦИИ ДЛЯ ЗАРАБОТКА ----------
+def get_referral_link(bot_username: str, user_id: int) -> str:
+    return f"https://t.me/{bot_username}?start=ref_{user_id}"
+
+def can_submit_tiktok(user_id: int) -> Tuple[bool, int]:
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT last_completed FROM tiktok_tasks WHERE user_id = ?", (user_id,))
+    row = c.fetchone()
+    last = row[0] if row else 0
+    now = int(datetime.now().timestamp())
+    if now - last < 86400:
+        return False, 86400 - (now - last)
+    return True, 0
+
+def set_tiktok_completed(user_id: int):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("INSERT OR REPLACE INTO tiktok_tasks (user_id, last_completed) VALUES (?, ?)", (user_id, int(datetime.now().timestamp())))
+    conn.commit()
+    conn.close()
+
+def can_submit_token(user_id: int) -> Tuple[bool, int, int]:
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT last_reset, count_this_period FROM token_stats WHERE user_id = ?", (user_id,))
+    row = c.fetchone()
+    now = int(datetime.now().timestamp())
+    if not row:
+        return True, 0, 0
+    last_reset, cnt = row
+    if now - last_reset >= 259200:
+        return True, 0, 0
+    if cnt >= 3:
+        return False, 259200 - (now - last_reset), cnt
+    return True, 0, cnt
+
+def register_token_usage(user_id: int):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    now = int(datetime.now().timestamp())
+    c.execute("SELECT last_reset, count_this_period FROM token_stats WHERE user_id = ?", (user_id,))
+    row = c.fetchone()
+    if not row:
+        c.execute("INSERT INTO token_stats (user_id, last_reset, count_this_period) VALUES (?, ?, 1)", (user_id, now))
+    else:
+        last_reset, cnt = row
+        if now - last_reset >= 259200:
+            c.execute("UPDATE token_stats SET last_reset = ?, count_this_period = 1 WHERE user_id = ?", (now, user_id))
+        else:
+            c.execute("UPDATE token_stats SET count_this_period = count_this_period + 1 WHERE user_id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+
+# ------------------ БОТ ------------------
+bot = Bot(token=BOT_TOKEN)
+storage = MemoryStorage()
+dp = Dispatcher(storage=storage)
+BOT_USERNAME = None
+
+async def get_bot_username():
+    global BOT_USERNAME
+    me = await bot.get_me()
+    BOT_USERNAME = me.username
+
+# ---------- КАРТИНКА ДЛЯ ГЛАВНОГО МЕНЮ ----------
+MAIN_MENU_PHOTO_URL = "https://gspics.org/images/2026/04/27/IAm18s.png"
+MAIN_MENU_PHOTO_FILE_ID = None
+
+async def get_main_menu_photo() -> str:
+    global MAIN_MENU_PHOTO_FILE_ID
+    if MAIN_MENU_PHOTO_FILE_ID:
+        return MAIN_MENU_PHOTO_FILE_ID
+    try:
+        msg = await bot.send_photo(chat_id=ADMIN_IDS[0] if ADMIN_IDS else 123456789, photo=MAIN_MENU_PHOTO_URL)
+        MAIN_MENU_PHOTO_FILE_ID = msg.photo[-1].file_id
+        return MAIN_MENU_PHOTO_FILE_ID
+    except Exception:
+        return None
+
+# ---------- ПРОВЕРКА ПОДПИСКИ ----------
+async def is_subscribed(user_id: int) -> bool:
+    try:
+        chat = await bot.get_chat(REQUIRED_CHANNEL)
+        member = await bot.get_chat_member(chat.id, user_id)
+        return member.status in ["member", "administrator", "creator"]
+    except Exception:
+        return False
+
+# ---------- КЛАВИАТУРЫ ----------
+def get_main_keyboard(user_id: int) -> ReplyKeyboardMarkup:
+    buttons = [
+        [KeyboardButton(text="🎬 Смотреть видео"), KeyboardButton(text="💎 Купить алмазы")],
+        [KeyboardButton(text="⭐ Премиум"), KeyboardButton(text="💰 Заработать")],
+        [KeyboardButton(text="👤 Профиль"), KeyboardButton(text="🎁 Ежедневный бонус")],
+        [KeyboardButton(text="🎫 Промокод"), KeyboardButton(text="📞 Поддержка")],
+        [KeyboardButton(text="🔄 Обновить")]
+    ]
     if user_id in ADMIN_IDS:
-        builder.row(InlineKeyboardButton(text="⚙️ АДМИН ПАНЕЛЬ", callback_data="admin_panel"))
+        buttons.append([KeyboardButton(text="⚙️ Админ панель")])
+    return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
+
+def get_subscription_keyboard() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="📢 ПОДПИСАТЬСЯ НА КАНАЛ", url="https://t.me/Scam_officiali"))
+    builder.row(InlineKeyboardButton(text="✅ ПРОВЕРИТЬ ПОДПИСКУ", callback_data="check_sub"))
+    return builder.as_markup()
+
+def get_earn_keyboard() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="👥 РЕФЕРАЛЫ", callback_data="earn_ref"))
+    builder.row(InlineKeyboardButton(text="📸 TIKTOK", callback_data="earn_tiktok"))
+    builder.row(InlineKeyboardButton(text="🤖 ТОКЕН БОТА", callback_data="earn_token"))
+    builder.row(InlineKeyboardButton(text="❌ ОТМЕНА", callback_data="cancel_earn"))
+    return builder.as_markup()
+
+def get_tiktok_admin_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="✅ ПРИНЯТО (12💎)", callback_data=f"tiktok_accept_{user_id}"))
+    builder.row(InlineKeyboardButton(text="❌ ОТКЛОНИТЬ", callback_data=f"tiktok_reject_{user_id}"))
     return builder.as_markup()
 
 def get_diamond_packs_keyboard() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     for diamonds, price in DIAMOND_PACKS.items():
         builder.row(InlineKeyboardButton(text=f"💎 {diamonds} алмазов – {price}₽", callback_data=f"buy_diamonds_{diamonds}"))
-    builder.row(InlineKeyboardButton(text="◀️ НАЗАД", callback_data="main_menu"))
+    builder.row(InlineKeyboardButton(text="◀️ ОТМЕНА", callback_data="cancel"))
     return builder.as_markup()
 
 def get_payment_keyboard(payment_id: str) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.row(InlineKeyboardButton(text="📋 СКОПИРОВАТЬ ID", callback_data=f"copy_id_{payment_id}"))
     builder.row(InlineKeyboardButton(text="✅ Я ОПЛАТИЛ", callback_data="i_paid"))
-    builder.row(InlineKeyboardButton(text="❌ ОТМЕНА", callback_data="main_menu"))
+    builder.row(InlineKeyboardButton(text="❌ ОТМЕНА", callback_data="cancel"))
     return builder.as_markup()
 
 def get_admin_payment_keyboard(user_id: int, payment_id: str, amount_rub: int, type_payment: str) -> InlineKeyboardMarkup:
@@ -360,22 +520,23 @@ def get_admin_payment_keyboard(user_id: int, payment_id: str, amount_rub: int, t
 
 def get_admin_keyboard() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    builder.row(InlineKeyboardButton(text="➕ ДОБАВИТЬ ВИДЕО", callback_data="admin_add_video"))
-    builder.row(InlineKeyboardButton(text="🗑 УДАЛИТЬ ВИДЕО", callback_data="admin_del_video"))
+    builder.row(InlineKeyboardButton(text="➕ ДОБАВИТЬ КОНТЕНТ", callback_data="admin_add_content"))
+    builder.row(InlineKeyboardButton(text="🗑 УДАЛИТЬ КОНТЕНТ", callback_data="admin_del_content"))
     builder.row(InlineKeyboardButton(text="💎 ВЫДАТЬ АЛМАЗЫ", callback_data="admin_give_diamonds"))
     builder.row(InlineKeyboardButton(text="⭐ ВЫДАТЬ PREMIUM", callback_data="admin_give_premium"))
     builder.row(InlineKeyboardButton(text="🚫 ЗАБАНИТЬ/РАЗБАНИТЬ", callback_data="admin_ban"))
     builder.row(InlineKeyboardButton(text="🎟 ПРОМОКОДЫ", callback_data="admin_promocodes"))
     builder.row(InlineKeyboardButton(text="📊 СТАТИСТИКА", callback_data="admin_stats"))
     builder.row(InlineKeyboardButton(text="📢 РАССЫЛКА", callback_data="admin_broadcast"))
-    builder.row(InlineKeyboardButton(text="◀️ НАЗАД", callback_data="main_menu"))
+    builder.row(InlineKeyboardButton(text="🪞 ЗЕРКАЛА", callback_data="admin_mirror"))
+    builder.row(InlineKeyboardButton(text="◀️ ВЫХОД", callback_data="exit_admin"))
     return builder.as_markup()
 
 # ------------------ FSM ------------------
 class AdminStates(StatesGroup):
-    waiting_for_video_name = State()
-    waiting_for_video_file = State()
-    waiting_for_video_is_vip = State()
+    waiting_for_content_file = State()
+    waiting_for_more_videos = State()
+    waiting_for_content_type = State()
     waiting_for_diamonds_user = State()
     waiting_for_diamonds_amount = State()
     waiting_for_premium_user = State()
@@ -386,85 +547,145 @@ class AdminStates(StatesGroup):
     waiting_for_promo_uses = State()
     waiting_for_broadcast = State()
 
+class PromoState(StatesGroup):
+    waiting_for_code = State()
+
 class PaymentState(StatesGroup):
     waiting_for_screenshot = State()
 
-# ------------------ БОТ ------------------
-bot = Bot(token=BOT_TOKEN)
-storage = MemoryStorage()
-dp = Dispatcher(storage=storage)
+class TikTokState(StatesGroup):
+    waiting_for_screenshots = State()
 
+class TokenState(StatesGroup):
+    waiting_for_token = State()
+
+# ------------------ ГЛАВНОЕ МЕНЮ ------------------
+async def show_main_menu(message: Message, user_id: int):
+    user = get_user(user_id)
+    if not user:
+        await message.answer("Ошибка: пользователь не найден. Нажмите /start")
+        return
+    premium_active = user['is_premium'] and user['premium_until'] > int(datetime.now().timestamp())
+    premium_status = "✅ ДА" if premium_active else "❌ НЕТ"
+    text = (
+        f"🔞 ВНИМАНИЕ! ТОВАР 18+ 🔞\n\n"
+        f"👋 ПРИВЕТ, {user['username'] or 'гость'}!\n\n"
+        f"🏠 ГЛАВНОЕ МЕНЮ\n\n"
+        f"💎 АЛМАЗЫ: {user['balance']}\n"
+        f"⭐ PREMIUM: {premium_status}\n\n"
+        f"📢 НАШ КАНАЛ: t.me/Scam_officiali\n"
+        f"👨‍💼 АДМИН: @scam_lil"
+    )
+    kb = get_main_keyboard(user_id)
+    photo_id = await get_main_menu_photo()
+    if photo_id:
+        await message.answer_photo(photo=photo_id, caption=text, reply_markup=kb)
+    else:
+        await message.answer(text, reply_markup=kb)
+
+# ---------- КОМАНДА СТАРТ ----------
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     user_id = message.from_user.id
     username = message.from_user.username or "radion"
-    if not get_user(user_id):
-        create_user(user_id, username)
+    referrer_id = 0
+    if len(message.text.split()) > 1:
+        arg = message.text.split()[1]
+        if arg.startswith("ref_"):
+            try:
+                referrer_id = int(arg.split("_")[1])
+            except:
+                pass
+    if referrer_id == user_id:
+        referrer_id = 0
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,))
+    if not c.fetchone():
+        payment_id = generate_unique_payment_id()
+        c.execute("INSERT INTO users (user_id, username, payment_id, referrer_id) VALUES (?, ?, ?, ?)",
+                  (user_id, username, payment_id, referrer_id))
+        if referrer_id != 0:
+            c.execute("SELECT banned FROM users WHERE user_id = ?", (referrer_id,))
+            ref = c.fetchone()
+            if ref and not ref[0]:
+                c.execute("UPDATE users SET balance = balance + 1, referrals_count = referrals_count + 1 WHERE user_id = ?", (referrer_id,))
+                c.execute("INSERT INTO diamond_logs (user_id, amount, reason, timestamp) VALUES (?, ?, ?, ?)",
+                          (referrer_id, 1, f"Реферал {user_id}", int(datetime.now().timestamp())))
+        conn.commit()
+    conn.close()
     user = get_user(user_id)
     if user['banned']:
         await message.answer("❌ ВЫ ЗАБЛОКИРОВАНЫ В БОТЕ.")
         return
-    await message.answer("🔞 ВНИМАНИЕ! ТОВАР 18+ 🔞\n\nДобро пожаловать в магазин!", reply_markup=get_main_keyboard(user_id))
+    await show_main_menu(message, user_id)
 
-@dp.callback_query(F.data == "main_menu")
-async def main_menu_callback(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    user = get_user(user_id)
-    if user['banned']:
-        await callback.answer("❌ ВЫ ЗАБЛОКИРОВАНЫ", show_alert=True)
-        return
-    await callback.message.edit_text("🔞 ВНИМАНИЕ! ТОВАР 18+ 🔞", reply_markup=get_main_keyboard(user_id))
-    await callback.answer()
+# ---------- ОБНОВИТЬ ----------
+@dp.message(lambda m: m.text == "🔄 Обновить")
+async def refresh_main_menu(message: Message, state: FSMContext):
+    await state.clear()
+    await show_main_menu(message, message.from_user.id)
 
-@dp.callback_query(F.data == "watch_video")
-async def watch_video(callback: CallbackQuery):
+# ---------- ПРОВЕРКА ПОДПИСКИ ----------
+@dp.callback_query(F.data == "check_sub")
+async def check_subscription(callback: CallbackQuery):
     user_id = callback.from_user.id
+    if await is_subscribed(user_id):
+        await callback.message.delete()
+        await show_main_menu(callback.message, user_id)
+    else:
+        await callback.answer("❌ Вы ещё не подписаны на канал! Подпишитесь и нажмите снова.", show_alert=True)
+
+# ---------- СМОТРЕТЬ ВИДЕО ----------
+@dp.message(lambda m: m.text == "🎬 Смотреть видео")
+async def watch_content_command(message: Message, state: FSMContext):
+    await state.clear()
+    user_id = message.from_user.id
     user = get_user(user_id)
-    if user['banned']:
-        await callback.answer("Доступ запрещён", show_alert=True)
+    if not user or user['banned']:
+        await message.answer("❌ Доступ запрещён.")
         return
-    video = get_random_video()
-    if not video:
-        await callback.answer("Видео пока нет в базе.", show_alert=True)
+    if not await is_subscribed(user_id):
+        await message.answer(
+            "⚠️ ДЛЯ ПРОСМОТРА КОНТЕНТА ПОДПИШИТЕСЬ НА КАНАЛ:\nhttps://t.me/Scam_officiali\n\n"
+            "После подписки нажмите кнопку ниже 👇",
+            reply_markup=get_subscription_keyboard()
+        )
         return
-    # Проверка VIP? У нас все видео из обычного списка, но если вдруг попалось VIP – проверим
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT is_vip FROM videos WHERE id = ?", (video['id'],))
-    is_vip = c.fetchone()[0]
-    conn.close()
-    if is_vip == 1:
+    content = get_random_content(media_type='video')
+    if not content:
+        await message.answer("❌ Видео пока нет в базе. Администратор добавит позже.")
+        return
+    if content['is_vip'] == 1:
         premium_active = user['is_premium'] and user['premium_until'] > int(datetime.now().timestamp())
         if not premium_active:
-            await callback.answer("❌ Это VIP-видео. Оформите PREMIUM подписку!", show_alert=True)
+            await message.answer("❌ Это VIP-контент. Оформите PREMIUM подписку!")
             return
     if user['balance'] < VIDEO_PRICE:
-        await callback.answer(f"❌ Недостаточно алмазов! Нужно {VIDEO_PRICE}💎", show_alert=True)
+        await message.answer(f"❌ Недостаточно алмазов! Нужно {VIDEO_PRICE}💎. Пополните баланс через «Купить алмазы».")
         return
-    # Списываем
     update_balance(user_id, -VIDEO_PRICE)
-    add_purchase(user_id, video['id'])
-    await callback.message.answer_video(video['file_id'], caption=f"🎬 {video['name']}\n\nСписано {VIDEO_PRICE}💎")
-    await callback.answer("✅ ВИДЕО ЗАГРУЖАЕТСЯ...")
-    await main_menu_callback(callback)
+    add_purchase(user_id, content['id'])
+    await message.answer_video(content['file_id'], caption=f"🎬 {content['name']}\n\nСписано {VIDEO_PRICE}💎")
 
-@dp.callback_query(F.data == "buy_diamonds_menu")
-async def buy_diamonds_menu(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    if get_user(user_id)['banned']:
-        await callback.answer("Доступ запрещён", show_alert=True)
+# ---------- КУПИТЬ АЛМАЗЫ ----------
+@dp.message(lambda m: m.text == "💎 Купить алмазы")
+async def buy_diamonds_command(message: Message, state: FSMContext):
+    await state.clear()
+    user_id = message.from_user.id
+    user = get_user(user_id)
+    if not user or user['banned']:
+        await message.answer("❌ Доступ запрещён.")
         return
-    await callback.message.edit_text("💎 ВЫБЕРИТЕ КОЛИЧЕСТВО АЛМАЗОВ:", reply_markup=get_diamond_packs_keyboard())
-    await callback.answer()
+    await message.answer("💎 ВЫБЕРИТЕ КОЛИЧЕСТВО АЛМАЗОВ:", reply_markup=get_diamond_packs_keyboard())
 
 @dp.callback_query(F.data.startswith("buy_diamonds_"))
-async def buy_diamonds_pack(callback: CallbackQuery, state: FSMContext):
+async def buy_diamonds_pack(callback: CallbackQuery):
     diamonds = int(callback.data.split("_")[2])
     price = DIAMOND_PACKS[diamonds]
     user_id = callback.from_user.id
     user = get_user(user_id)
     payment_id = user['payment_id']
-    # Сохраняем заявку
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("INSERT OR REPLACE INTO pending_payments (user_id, payment_id, amount_rub, type, diamonds, timestamp, status) VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -478,32 +699,9 @@ async def buy_diamonds_pack(callback: CallbackQuery, state: FSMContext):
     await callback.message.edit_text(text, reply_markup=get_payment_keyboard(payment_id))
     await callback.answer()
 
-@dp.callback_query(F.data == "premium_menu")
-async def premium_menu(callback: CallbackQuery, state: FSMContext):
-    user_id = callback.from_user.id
-    user = get_user(user_id)
-    if user['banned']:
-        await callback.answer("Доступ запрещён", show_alert=True)
-        return
-    payment_id = user['payment_id']
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("INSERT OR REPLACE INTO pending_payments (user_id, payment_id, amount_rub, type, diamonds, timestamp, status) VALUES (?, ?, ?, ?, ?, ?, ?)",
-              (user_id, payment_id, PREMIUM_PRICE_RUB, 'premium', 0, int(datetime.now().timestamp()), 'pending'))
-    conn.commit()
-    conn.close()
-    text = (f"⭐ PREMIUM ПОДПИСКА (30 ДНЕЙ)\n\n▫️ ДОСТУП К VIP-КОНТЕНТУ В БОТЕ\n▫️ 5 VIP ВИДЕО КАЖДЫЙ ДЕНЬ\n"
-            f"▫️ ЕЖЕДНЕВНЫЙ БОНУС {DAILY_BONUS_PREMIUM}💎\n▫️ ПРИОРИТЕТНАЯ ПОДДЕРЖКА\n\n"
-            f"💰 ЦЕНА: {PREMIUM_PRICE_RUB} ₽\n\n💳 РЕКВИЗИТЫ ДЛЯ ОПЛАТЫ:\n{PAYMENT_DETAILS['card']} | {PAYMENT_DETAILS['name']}\n\n"
-            f"🆔 ВАШ ID ДЛЯ ОПЛАТЫ: {payment_id}\n📌 ВСТАВЬТЕ ЭТОТ ID В КОММЕНТАРИЙ К ПЕРЕВОДУ!\n\n"
-            f"📌 ПОСЛЕ ОПЛАТЫ НАЖМИТЕ «✅ Я ОПЛАТИЛ» И ОТПРАВЬТЕ ЧЕК")
-    await callback.message.edit_text(text, reply_markup=get_payment_keyboard(payment_id))
-    await callback.answer()
-
 @dp.callback_query(F.data == "i_paid")
 async def i_paid(callback: CallbackQuery, state: FSMContext):
     await state.set_state(PaymentState.waiting_for_screenshot)
-    # Сохраним user_id, чтобы знать, к какой заявке привязать скрин
     await state.update_data(user_id=callback.from_user.id)
     await callback.message.edit_text("📸 Отправьте скриншот чека (фото или файл). После проверки администратор начислит алмазы или премиум.")
     await callback.answer()
@@ -511,8 +709,6 @@ async def i_paid(callback: CallbackQuery, state: FSMContext):
 @dp.message(PaymentState.waiting_for_screenshot, F.photo | F.document)
 async def receive_screenshot(message: Message, state: FSMContext):
     user_id = message.from_user.id
-    data = await state.get_data()
-    # Находим последнюю активную заявку пользователя
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("SELECT payment_id, amount_rub, type, diamonds FROM pending_payments WHERE user_id = ? AND status = 'pending' ORDER BY timestamp DESC LIMIT 1", (user_id,))
@@ -523,14 +719,12 @@ async def receive_screenshot(message: Message, state: FSMContext):
         await state.clear()
         return
     payment_id, amount, pay_type, diamonds = row
-    # Пересылаем админу
     caption = f"📨 Новая заявка на оплату!\n👤 Пользователь: {user_id} (@{message.from_user.username})\n💰 Сумма: {amount}₽\n📦 Товар: {pay_type}\n🆔 Payment ID: {payment_id}"
     if pay_type == 'diamonds':
         caption += f"\n💎 Алмазов: {diamonds}"
     else:
         caption += f"\n⭐ Премиум подписка"
-    admin_ids = ADMIN_IDS
-    for admin_id in admin_ids:
+    for admin_id in ADMIN_IDS:
         if message.photo:
             await bot.send_photo(admin_id, message.photo[-1].file_id, caption=caption, reply_markup=get_admin_payment_keyboard(user_id, payment_id, amount, pay_type))
         elif message.document:
@@ -538,43 +732,17 @@ async def receive_screenshot(message: Message, state: FSMContext):
     await message.answer("✅ Чек отправлен администратору. Ожидайте подтверждения.")
     await state.clear()
 
-# ------------------ ОБРАБОТКА ДЕЙСТВИЙ АДМИНА ------------------
-@dp.callback_query(F.data.startswith("admin_ban_user_"))
-async def admin_ban_user(callback: CallbackQuery):
-    if callback.from_user.id not in ADMIN_IDS:
-        await callback.answer("Нет доступа", show_alert=True)
-        return
-    user_id = int(callback.data.split("_")[3])
-    set_ban(user_id, True)
-    await callback.message.edit_text(f"✅ Пользователь {user_id} забанен.")
-    await callback.answer()
-    # Уведомим пользователя, если возможно
-    try:
-        await bot.send_message(user_id, "❌ Вы были забанены администратором за нарушение правил оплаты.")
-    except:
-        pass
-
+# ---------- АДМИН ОДОБРЕНИЯ ----------
 @dp.callback_query(F.data.startswith("admin_approve_"))
 async def admin_approve(callback: CallbackQuery):
     if callback.from_user.id not in ADMIN_IDS:
         await callback.answer("Нет доступа", show_alert=True)
         return
-    parts = callback.data.split("_")
-    # формат: admin_approve_{payment_id}_{user_id}_{type}
-    payment_id = parts[2]  # может содержать подчеркивания? payment_id имеет формат #Radion_цифры, но подчеркивание есть
-    # нужно правильно извлечь: admin_approve_#Radion_12345_123456789_diamonds
-    # лучше пересобрать: начиная с 2 индекса до предпоследнего?
-    # упростим: разобьём с учетом, что payment_id начинается с #Radion_
-    # используем срез: найти все части после 'admin_approve_'
     rest = callback.data[len("admin_approve_"):]
-    # rest = "#Radion_12345_456789_diamonds"
-    # разделим по '_' но с учетом, что в payment_id есть '_'
     parts2 = rest.split('_')
-    # payment_id = parts2[0] + '_' + parts2[1]   например #Radion_12345
     payment_id = parts2[0] + '_' + parts2[1]
     user_id = int(parts2[2])
     pay_type = parts2[3]
-    # Получаем данные из pending_payments
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("SELECT diamonds, amount_rub FROM pending_payments WHERE payment_id = ? AND user_id = ? AND status = 'pending'", (payment_id, user_id))
@@ -586,14 +754,13 @@ async def admin_approve(callback: CallbackQuery):
     if pay_type == 'diamonds':
         update_balance(user_id, diamonds)
         await bot.send_message(user_id, f"✅ Ваша оплата на {amount}₽ подтверждена! Вам начислено {diamonds}💎.")
-    else:  # premium
+    else:
         set_premium(user_id, 30)
         await bot.send_message(user_id, f"✅ Ваша оплата на {amount}₽ подтверждена! PREMIUM подписка активирована на 30 дней.")
-    # Обновляем статус
     c.execute("UPDATE pending_payments SET status = 'approved' WHERE payment_id = ? AND user_id = ?", (payment_id, user_id))
     conn.commit()
     conn.close()
-    await callback.message.edit_text(f"✅ Выдано пользователю {user_id}.")
+    await callback.message.answer(f"✅ Выдано пользователю {user_id}.")
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("admin_reject_"))
@@ -610,49 +777,112 @@ async def admin_reject(callback: CallbackQuery):
     c.execute("UPDATE pending_payments SET status = 'rejected' WHERE payment_id = ? AND user_id = ?", (payment_id, user_id))
     conn.commit()
     conn.close()
-    await bot.send_message(user_id, "❌ Ваша оплата отклонена администратором. Проверьте правильность заполнения ID или свяжитесь с поддержкой.")
-    await callback.message.edit_text(f"❌ Отказано пользователю {user_id}.")
+    try:
+        await bot.send_message(user_id, "❌ Ваша оплата отклонена администратором. Проверьте правильность заполнения ID или свяжитесь с поддержкой.")
+    except:
+        pass
+    await callback.message.answer(f"❌ Отказано пользователю {user_id}.")
     await callback.answer()
 
-@dp.callback_query(F.data == "profile")
-async def profile_callback(callback: CallbackQuery):
-    user_id = callback.from_user.id
+@dp.callback_query(F.data.startswith("admin_ban_user_"))
+async def admin_ban_user(callback: CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    user_id = int(callback.data.split("_")[3])
+    set_ban(user_id, True)
+    await callback.message.answer(f"✅ Пользователь {user_id} забанен.")
+    await callback.answer()
+    try:
+        await bot.send_message(user_id, "❌ Вы были забанены администратором за нарушение правил оплаты.")
+    except:
+        pass
+
+@dp.callback_query(F.data.startswith("copy_id_"))
+async def copy_payment_id(callback: CallbackQuery):
+    payment_id = callback.data.split("_", 2)[2]
+    await callback.answer(f"✅ ID скопирован: {payment_id}", show_alert=True)
+    await callback.message.answer(f"🆔 Ваш ID для оплаты: `{payment_id}`", parse_mode="Markdown")
+
+# ---------- ПРЕМИУМ ----------
+@dp.message(lambda m: m.text == "⭐ Премиум")
+async def premium_command(message: Message, state: FSMContext):
+    await state.clear()
+    user_id = message.from_user.id
     user = get_user(user_id)
+    if not user or user['banned']:
+        await message.answer("❌ Доступ запрещён.")
+        return
+    payment_id = user['payment_id']
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("INSERT OR REPLACE INTO pending_payments (user_id, payment_id, amount_rub, type, diamonds, timestamp, status) VALUES (?, ?, ?, ?, ?, ?, ?)",
+              (user_id, payment_id, PREMIUM_PRICE_RUB, 'premium', 0, int(datetime.now().timestamp()), 'pending'))
+    conn.commit()
+    conn.close()
+    text = (f"⭐ PREMIUM ПОДПИСКА (30 ДНЕЙ)\n\n▫️ ДОСТУП К VIP-КОНТЕНТУ В БОТЕ\n▫️ 5 VIP ВИДЕО КАЖДЫЙ ДЕНЬ\n"
+            f"▫️ ЕЖЕДНЕВНЫЙ БОНУС {DAILY_BONUS_PREMIUM}💎\n▫️ ПРИОРИТЕТНАЯ ПОДДЕРЖКА\n\n"
+            f"💰 ЦЕНА: {PREMIUM_PRICE_RUB} ₽\n\n💳 РЕКВИЗИТЫ ДЛЯ ОПЛАТЫ:\n{PAYMENT_DETAILS['card']} | {PAYMENT_DETAILS['name']}\n\n"
+            f"🆔 ВАШ ID ДЛЯ ОПЛАТЫ: {payment_id}\n📌 ВСТАВЬТЕ ЭТОТ ID В КОММЕНТАРИЙ К ПЕРЕВОДУ!\n\n"
+            f"📌 ПОСЛЕ ОПЛАТЫ НАЖМИТЕ «✅ Я ОПЛАТИЛ» И ОТПРАВЬТЕ ЧЕК")
+    await message.answer(text, reply_markup=get_payment_keyboard(payment_id))
+
+# ---------- ПРОФИЛЬ ----------
+@dp.message(lambda m: m.text == "👤 Профиль")
+async def profile_command(message: Message, state: FSMContext):
+    await state.clear()
+    user_id = message.from_user.id
+    user = get_user(user_id)
+    if not user or user['banned']:
+        await message.answer("❌ Доступ запрещён.")
+        return
     premium_active = user['is_premium'] and user['premium_until'] > int(datetime.now().timestamp())
     premium_text = "✅ ДА" if premium_active else "❌ НЕТ"
     if premium_active:
         until = datetime.fromtimestamp(user['premium_until']).strftime("%d.%m.%Y")
         premium_text += f" (до {until})"
-    text = f"👤 ПРОФИЛЬ\n\n🆔 ID: {user_id}\n💎 АЛМАЗЫ: {user['balance']}\n⭐ PREMIUM: {premium_text}\n🔗 ВАШ ID ДЛЯ ОПЛАТЫ: {user['payment_id']}"
-    await callback.message.edit_text(text, reply_markup=get_main_keyboard(user_id))
-    await callback.answer()
+    text = (f"👤 ПРОФИЛЬ\n\n🆔 ID: {user_id}\n💎 АЛМАЗЫ: {user['balance']}\n⭐ PREMIUM: {premium_text}\n🔗 ВАШ ID ДЛЯ ОПЛАТЫ: {user['payment_id']}")
+    await message.answer(text)
 
-@dp.callback_query(F.data == "daily_bonus")
-async def daily_bonus_callback(callback: CallbackQuery):
-    user_id = callback.from_user.id
+# ---------- ЕЖЕДНЕВНЫЙ БОНУС ----------
+@dp.message(lambda m: m.text == "🎁 Ежедневный бонус")
+async def daily_bonus_command(message: Message, state: FSMContext):
+    await state.clear()
+    user_id = message.from_user.id
     user = get_user(user_id)
+    if not user or user['banned']:
+        await message.answer("❌ Доступ запрещён.")
+        return
+    if not await is_subscribed(user_id):
+        await message.answer(
+            "⚠️ ДЛЯ ПОЛУЧЕНИЯ БОНУСА ПОДПИШИТЕСЬ НА КАНАЛ:\nhttps://t.me/Scam_officiali\n\n"
+            "После подписки нажмите кнопку ниже 👇",
+            reply_markup=get_subscription_keyboard()
+        )
+        return
     last = user['daily_bonus_last']
     now = int(datetime.now().timestamp())
     if now - last < 86400:
-        wait_seconds = 86400 - (now - last)
-        h = wait_seconds // 3600
-        m = (wait_seconds % 3600) // 60
-        await callback.answer(f"Бонус уже получен. Следующий через {h}ч {m}мин.", show_alert=True)
+        wait = 86400 - (now - last)
+        h = wait // 3600
+        m = (wait % 3600) // 60
+        await message.answer(f"🎁 Бонус уже получен. Следующий через {h}ч {m}мин.")
         return
     premium_active = user['is_premium'] and user['premium_until'] > now
     bonus = DAILY_BONUS_PREMIUM if premium_active else DAILY_BONUS_NORMAL
     update_balance(user_id, bonus)
     set_daily_bonus_last(user_id, now)
-    await callback.message.edit_text(f"🎁 ЕЖЕДНЕВНЫЙ БОНУС: +{bonus}💎", reply_markup=get_main_keyboard(user_id))
-    await callback.answer(f"Получено {bonus}💎!")
+    await message.answer(f"🎁 ЕЖЕДНЕВНЫЙ БОНУС: +{bonus}💎")
+    await show_main_menu(message, user_id)
 
-@dp.callback_query(F.data == "promocode")
-async def promocode_start(callback: CallbackQuery, state: FSMContext):
-    await state.set_state(AdminStates.waiting_for_promo_code)  # используем состояние для ввода кода
-    await callback.message.edit_text("Введите промокод:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️ НАЗАД", callback_data="main_menu")]]))
-    await callback.answer()
+# ---------- ПРОМОКОД ----------
+@dp.message(lambda m: m.text == "🎫 Промокод")
+async def promocode_start(message: Message, state: FSMContext):
+    await state.clear()
+    await state.set_state(PromoState.waiting_for_code)
+    await message.answer("Введите промокод:")
 
-@dp.message(AdminStates.waiting_for_promo_code)
+@dp.message(PromoState.waiting_for_code)
 async def promocode_apply(message: Message, state: FSMContext):
     user_id = message.from_user.id
     code = message.text.strip().upper()
@@ -662,81 +892,316 @@ async def promocode_apply(message: Message, state: FSMContext):
     else:
         await message.answer("❌ Неверный или уже использованный промокод.")
     await state.clear()
-    await message.answer("Главное меню:", reply_markup=get_main_keyboard(user_id))
+    await show_main_menu(message, user_id)
 
-@dp.callback_query(F.data == "support")
-async def support_callback(callback: CallbackQuery):
-    await callback.message.edit_text("📞 Связь с администратором: @scam_lil", reply_markup=get_main_keyboard(callback.from_user.id))
+# ---------- ПОДДЕРЖКА ----------
+@dp.message(lambda m: m.text == "📞 Поддержка")
+async def support_command(message: Message, state: FSMContext):
+    await state.clear()
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("INSERT INTO support_messages (user_id, message, created_at, status) VALUES (?, ?, ?, ?)",
+              (message.from_user.id, message.text, int(datetime.now().timestamp()), 'pending'))
+    conn.commit()
+    conn.close()
+    await message.answer("📞 Связь с администратором: @scam_lil\nВаше сообщение сохранено, администратор ответит в ближайшее время.")
+
+# ---------- ЗАРАБОТОК ----------
+@dp.message(lambda m: m.text == "💰 Заработать")
+async def earn_menu(message: Message, state: FSMContext):
+    await state.clear()
+    user_id = message.from_user.id
+    user = get_user(user_id)
+    if not user or user['banned']:
+        await message.answer("❌ Доступ запрещён.")
+        return
+    text = "💰 **СПОСОБЫ ЗАРАБОТКА АЛМАЗОВ**\n\nВыберите один из вариантов:"
+    await message.answer(text, reply_markup=get_earn_keyboard(), parse_mode="Markdown")
+
+@dp.callback_query(F.data == "earn_ref")
+async def earn_ref(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    user = get_user(user_id)
+    if not user:
+        await callback.answer("Ошибка", show_alert=True)
+        return
+    if not BOT_USERNAME:
+        await get_bot_username()
+    link = get_referral_link(BOT_USERNAME, user_id)
+    text = (
+        f"👥 **РЕФЕРАЛЬНАЯ СИСТЕМА**\n\n"
+        f"👤 ВАШИ РЕФЕРАЛЫ: {user['referrals_count']}\n"
+        f"💰 ЗА КАЖДОГО ПРИГЛАШЕННОГО: +1💎\n\n"
+        f"🔗 ВАША ССЫЛКА:\n`{link}`\n\n"
+        f"📤 ПРОСТО ПЕРЕШЛИТЕ ЭТУ ССЫЛКУ ДРУЗЬЯМ!"
+    )
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️ НАЗАД", callback_data="back_to_earn")]]), parse_mode="Markdown")
     await callback.answer()
 
-# ------------------ АДМИН ПАНЕЛЬ ------------------
-@dp.callback_query(F.data == "admin_panel")
-async def admin_panel(callback: CallbackQuery):
+@dp.callback_query(F.data == "earn_tiktok")
+async def earn_tiktok(callback: CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
+    can, remain = can_submit_tiktok(user_id)
+    if not can:
+        hours = remain // 3600
+        mins = (remain % 3600) // 60
+        await callback.answer(f"Вы уже выполняли задание сегодня. Повторно через {hours}ч {mins}мин.", show_alert=True)
+        return
+    text = (
+        "📸 **ЗАДАНИЕ TIKTOK**\n\n"
+        "1️⃣ В ПОИСКЕ TIKTOK НАПИШИТЕ: **детское питание**\n"
+        "2️⃣ ПОД 10 ВИДЕО НАПИШИТЕ КОММЕНТАРИЙ:\n"
+        "🔞 `@RadionShop_bot не повторимый` 🔞\n"
+        "3️⃣ ОБЯЗАТЕЛЬНО ПОСТАВЬТЕ ЛАЙК НА СВОЙ КОММЕНТАРИЙ\n"
+        "4️⃣ СДЕЛАЙТЕ 10 СКРИНШОТОВ (ЛАЙК ДОЛЖЕН БЫТЬ ВИДЕН)\n"
+        "5️⃣ ОТПРАВЬТЕ ВСЕ 10 СКРИНШОТОВ **ПО ОДНОМУ** В БОТА\n\n"
+        "💰 НАГРАДА: 12💎\n"
+        "⏰ МОЖНО ВЫПОЛНЯТЬ 1 РАЗ В ДЕНЬ"
+    )
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📤 ОТПРАВИТЬ СКРИНЫ", callback_data="tiktok_send"), InlineKeyboardButton(text="◀️ НАЗАД", callback_data="back_to_earn")]]), parse_mode="Markdown")
+    await callback.answer()
+
+@dp.callback_query(F.data == "tiktok_send")
+async def tiktok_send_start(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(TikTokState.waiting_for_screenshots)
+    await state.update_data(photos=[])
+    await callback.message.edit_text("📸 Отправьте **10 скриншотов** по одному. Я соберу их.\nПосле получения 10-го фото они будут отправлены администратору на проверку.")
+    await callback.answer()
+
+@dp.message(TikTokState.waiting_for_screenshots, F.photo)
+async def tiktok_collect_photos(message: Message, state: FSMContext):
+    data = await state.get_data()
+    photos = data.get("photos", [])
+    photos.append(message.photo[-1].file_id)
+    await state.update_data(photos=photos)
+    count = len(photos)
+    if count < 10:
+        await message.answer(f"📸 Получен {count}/10 скриншот. Отправьте следующий.")
+    else:
+        admin_id = ADMIN_IDS[0]
+        media_group = []
+        for i, fid in enumerate(photos):
+            if i == 0:
+                caption = f"📸 Новая заявка TikTok от {message.from_user.id} (@{message.from_user.username})"
+                media_group.append(InputMediaPhoto(media=fid, caption=caption))
+            else:
+                media_group.append(InputMediaPhoto(media=fid))
+        await bot.send_media_group(admin_id, media=media_group)
+        await bot.send_message(admin_id, "Проверьте скриншоты и примите/отклоните задание.", reply_markup=get_tiktok_admin_keyboard(message.from_user.id))
+        await message.answer("✅ Все 10 скриншотов получены и отправлены администратору. Ожидайте начисления алмазов.")
+        await state.clear()
+
+@dp.callback_query(F.data.startswith("tiktok_accept_"))
+async def tiktok_accept(callback: CallbackQuery):
     if callback.from_user.id not in ADMIN_IDS:
         await callback.answer("Нет доступа", show_alert=True)
         return
-    await callback.message.edit_text("⚙️ АДМИН ПАНЕЛЬ:", reply_markup=get_admin_keyboard())
+    user_id = int(callback.data.split("_")[2])
+    update_balance(user_id, 12)
+    set_tiktok_completed(user_id)
+    await callback.message.edit_text(f"✅ Задание TikTok принято! Пользователю {user_id} начислено 12💎.")
+    await bot.send_message(user_id, "✅ Ваше задание TikTok принято! Вам начислено 12💎.")
     await callback.answer()
 
-# Добавление видео
-@dp.callback_query(F.data == "admin_add_video")
-async def admin_add_video_start(callback: CallbackQuery, state: FSMContext):
+@dp.callback_query(F.data.startswith("tiktok_reject_"))
+async def tiktok_reject(callback: CallbackQuery):
     if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("Нет доступа", show_alert=True)
         return
-    await state.set_state(AdminStates.waiting_for_video_name)
-    await callback.message.edit_text("Введите название видео:")
+    user_id = int(callback.data.split("_")[2])
+    await callback.message.edit_text(f"❌ Задание TikTok отклонено для пользователя {user_id}.")
+    await bot.send_message(user_id, "❌ Ваше задание TikTok отклонено. Попробуйте выполнить заново.")
     await callback.answer()
 
-@dp.message(AdminStates.waiting_for_video_name)
-async def admin_get_video_name(message: Message, state: FSMContext):
-    await state.update_data(video_name=message.text)
-    await state.set_state(AdminStates.waiting_for_video_file)
-    await message.answer("Отправьте видео файлом:")
+@dp.callback_query(F.data == "earn_token")
+async def earn_token(callback: CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
+    can, remain, used = can_submit_token(user_id)
+    if not can:
+        hours = remain // 3600
+        mins = (remain % 3600) // 60
+        await callback.answer(f"Вы уже использовали 3 токена. Следующий раз через {hours}ч {mins}мин.", show_alert=True)
+        return
+    text = (
+        f"🤖 **ПОЛУЧИ АЛМАЗЫ ЗА ТОКЕН БОТА!**\n\n"
+        f"1️⃣ ПЕРЕЙДИ К @BotFather\n"
+        f"2️⃣ ОТПРАВЬ КОМАНДУ /newbot\n"
+        f"3️⃣ ПРИДУМАЙ ИМЯ И USERNAME (ДОЛЖЕН ЗАКАНЧИВАТЬСЯ НА 'bot')\n"
+        f"4️⃣ СКОПИРУЙ ПОЛУЧЕННЫЙ ТОКЕН\n"
+        f"5️⃣ ОТПРАВЬ ТОКЕН СЮДА\n\n"
+        f"💰 **НАГРАДА: +3💎 ЗА КАЖДЫЙ РАБОЧИЙ ТОКЕН**\n"
+        f"📊 **ЛИМИТ: 3 ТОКЕНА РАЗ В 3 ДНЯ**\n"
+        f"✅ **ОСТАЛОСЬ МЕСТ: {3 - used} ИЗ 3**\n\n"
+        f"📌 ТОКЕНЫ АВТОМАТИЧЕСКИ ПРОВЕРЯЮТСЯ!"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔑 ПЕРЕЙТИ К @BotFather", url="https://t.me/BotFather")],
+        [InlineKeyboardButton(text="❌ ОТМЕНА", callback_data="back_to_earn")]
+    ])
+    await callback.message.edit_text(text, reply_markup=kb, parse_mode="Markdown")
+    await state.set_state(TokenState.waiting_for_token)
+    await callback.answer()
 
-@dp.message(AdminStates.waiting_for_video_file, F.video)
-async def admin_get_video_file(message: Message, state: FSMContext):
-    file_id = message.video.file_id
-    await state.update_data(file_id=file_id)
-    await state.set_state(AdminStates.waiting_for_video_is_vip)
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="ДА", callback_data="vip_yes"), InlineKeyboardButton(text="НЕТ", callback_data="vip_no")]])
-    await message.answer("Это VIP-видео?", reply_markup=keyboard)
+@dp.message(TokenState.waiting_for_token)
+async def token_submit(message: Message, state: FSMContext):
+    user_id = message.from_user.id
+    token = message.text.strip()
+    can, remain, used = can_submit_token(user_id)
+    if not can:
+        hours = remain // 3600
+        mins = (remain % 3600) // 60
+        await message.answer(f"❌ Лимит токенов. Повторите через {hours}ч {mins}мин.")
+        await state.clear()
+        return
 
-@dp.callback_query(StateFilter(AdminStates.waiting_for_video_is_vip))
-async def admin_get_vip_flag(callback: CallbackQuery, state: FSMContext):
-    is_vip = 1 if callback.data == "vip_yes" else 0
-    data = await state.get_data()
-    add_video(data["video_name"], data["file_id"], is_vip)
+    bot_username = None
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.get(f"https://api.telegram.org/bot{token}/getMe") as resp:
+                data = await resp.json()
+                if not data.get("ok"):
+                    await message.answer("❌ Токен недействителен. Попробуйте другой.")
+                    return
+                bot_username = data["result"].get("username")
+        except Exception:
+            await message.answer("❌ Ошибка проверки токена. Попробуйте позже.")
+            return
+
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT 1 FROM user_tokens WHERE user_id = ? AND token = ?", (user_id, token))
+    if c.fetchone():
+        conn.close()
+        await message.answer("❌ Вы уже использовали этот токен ранее.")
+        return
+
+    now = int(datetime.now().timestamp())
+    c.execute("INSERT INTO user_tokens (user_id, token, submitted_at, bot_username) VALUES (?, ?, ?, ?)",
+              (user_id, token, now, bot_username))
+    conn.commit()
+    conn.close()
+
+    register_token_usage(user_id)
+    update_balance(user_id, 3)
+
+    reply = f"✅ Токен принят! Вам начислено +3💎."
+    if bot_username:
+        reply += f"\n🤖 Юзернейм бота: @{bot_username}"
+    await message.answer(reply)
     await state.clear()
-    await callback.message.edit_text("✅ Видео добавлено!")
-    await admin_panel(callback)
 
-# Удаление видео
-@dp.callback_query(F.data == "admin_del_video")
-async def admin_del_video_start(callback: CallbackQuery):
-    if callback.from_user.id not in ADMIN_IDS:
+@dp.callback_query(F.data == "back_to_earn")
+async def back_to_earn(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await earn_menu(callback.message, state)
+    await callback.answer()
+
+@dp.callback_query(F.data == "cancel_earn")
+async def cancel_earn(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.delete()
+    await callback.answer()
+
+@dp.callback_query(F.data == "cancel")
+async def cancel_action(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.answer("Действие отменено.")
+    await callback.answer()
+
+# ---------- АДМИН ПАНЕЛЬ ----------
+@dp.message(lambda m: m.text == "⚙️ Админ панель")
+async def admin_panel_command(message: Message, state: FSMContext):
+    await state.clear()
+    user_id = message.from_user.id
+    if user_id not in ADMIN_IDS:
+        await message.answer("⛔ Нет доступа.")
         return
-    videos = get_all_videos()
+    await message.answer("⚙️ АДМИН ПАНЕЛЬ:", reply_markup=get_admin_keyboard())
+
+@dp.callback_query(F.data == "admin_add_content")
+async def admin_add_content_start(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    await state.set_state(AdminStates.waiting_for_content_file)
+    await state.update_data(videos=[])
+    await callback.message.edit_text("📹 Отправьте видео (можно несколько по одному). После каждого видео я спрошу, нужно ли добавить ещё.\nДля завершения нажмите «Закончить».")
+    await callback.answer()
+
+@dp.message(AdminStates.waiting_for_content_file, F.video)
+async def admin_get_video_file(message: Message, state: FSMContext):
+    data = await state.get_data()
+    videos = data.get("videos", [])
+    videos.append(message.video.file_id)
+    await state.update_data(videos=videos)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ ДОБАВИТЬ ЕЩЁ", callback_data="add_more_video")],
+        [InlineKeyboardButton(text="✅ ЗАКОНЧИТЬ", callback_data="finish_videos")]
+    ])
+    await message.answer(f"📹 Видео #{len(videos)} получено. Что дальше?", reply_markup=kb)
+
+@dp.callback_query(F.data == "add_more_video")
+async def add_more_video(callback: CallbackQuery, state: FSMContext):
+    await callback.message.edit_text("📹 Отправьте следующее видео (или нажмите «Закончить»).")
+    await callback.answer()
+
+@dp.callback_query(F.data == "finish_videos")
+async def finish_videos(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    videos = data.get("videos", [])
     if not videos:
-        await callback.message.edit_text("Нет видео для удаления", reply_markup=get_admin_keyboard())
+        await callback.message.answer("Нет видео для сохранения.")
+        await state.clear()
+        return
+    await state.update_data(videos_to_save=videos)
+    await state.set_state(AdminStates.waiting_for_content_type)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📀 ОБЫЧНЫЕ", callback_data="type_normal_all")],
+        [InlineKeyboardButton(text="👑 VIP", callback_data="type_vip_all")]
+    ])
+    await callback.message.edit_text(f"Получено {len(videos)} видео. Выберите тип для всех:", reply_markup=kb)
+    await callback.answer()
+
+@dp.callback_query(StateFilter(AdminStates.waiting_for_content_type), F.data.startswith("type_"))
+async def admin_set_vip_for_all(callback: CallbackQuery, state: FSMContext):
+    is_vip = 1 if callback.data == "type_vip_all" else 0
+    data = await state.get_data()
+    videos = data.get("videos_to_save", [])
+    for file_id in videos:
+        add_content(file_id, "video", is_vip)
+    await state.clear()
+    await callback.message.edit_text(f"✅ Добавлено {len(videos)} видео.")
+    await callback.answer()
+
+# ---------- УДАЛЕНИЕ КОНТЕНТА ----------
+@dp.callback_query(F.data == "admin_del_content")
+async def admin_del_content_start(callback: CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    items = get_all_content()
+    if not items:
+        await callback.message.answer("Нет контента для удаления")
         return
     builder = InlineKeyboardBuilder()
-    for v in videos:
-        builder.row(InlineKeyboardButton(text=v['name'], callback_data=f"del_video_{v['id']}"))
-    builder.row(InlineKeyboardButton(text="◀️ НАЗАД", callback_data="admin_panel"))
-    await callback.message.edit_text("Выберите видео для удаления:", reply_markup=builder.as_markup())
+    for item in items:
+        builder.row(InlineKeyboardButton(text=f"{item['name']} ({item['media_type']})", callback_data=f"del_content_{item['id']}"))
+    builder.row(InlineKeyboardButton(text="◀️ НАЗАД", callback_data="exit_admin"))
+    await callback.message.edit_text("Выберите контент для удаления:", reply_markup=builder.as_markup())
     await callback.answer()
 
-@dp.callback_query(F.data.startswith("del_video_"))
-async def admin_del_video_confirm(callback: CallbackQuery):
-    video_id = int(callback.data.split("_")[2])
-    remove_video(video_id)
-    await callback.message.edit_text("🗑 Видео удалено")
-    await admin_panel(callback)
+@dp.callback_query(F.data.startswith("del_content_"))
+async def admin_del_content_confirm(callback: CallbackQuery):
+    content_id = int(callback.data.split("_")[2])
+    remove_content(content_id)
+    await callback.message.answer("🗑 Контент удалён")
+    await callback.answer()
 
-# Выдача алмазов
+# ---------- ВЫДАЧА АЛМАЗОВ ----------
 @dp.callback_query(F.data == "admin_give_diamonds")
 async def admin_give_diamonds_start(callback: CallbackQuery, state: FSMContext):
     if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("Нет доступа", show_alert=True)
         return
     await state.set_state(AdminStates.waiting_for_diamonds_user)
     await callback.message.edit_text("Введите ID пользователя:")
@@ -768,12 +1233,12 @@ async def admin_give_diamonds_amount(message: Message, state: FSMContext):
     update_balance(user_id, amount)
     await state.clear()
     await message.answer(f"✅ Пользователю {user_id} выдано {amount}💎")
-    await admin_panel(message)
 
-# Выдача премиума
+# ---------- ВЫДАЧА ПРЕМИУМА ----------
 @dp.callback_query(F.data == "admin_give_premium")
 async def admin_give_premium_start(callback: CallbackQuery, state: FSMContext):
     if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("Нет доступа", show_alert=True)
         return
     await state.set_state(AdminStates.waiting_for_premium_user)
     await callback.message.edit_text("Введите ID пользователя:")
@@ -805,12 +1270,12 @@ async def admin_give_premium_days(message: Message, state: FSMContext):
     set_premium(user_id, days)
     await state.clear()
     await message.answer(f"✅ Пользователю {user_id} выдан PREMIUM на {days} дней")
-    await admin_panel(message)
 
-# Бан/разбан
+# ---------- БАН ----------
 @dp.callback_query(F.data == "admin_ban")
 async def admin_ban_start(callback: CallbackQuery, state: FSMContext):
     if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("Нет доступа", show_alert=True)
         return
     await state.set_state(AdminStates.waiting_for_ban_user)
     await callback.message.edit_text("Введите ID пользователя для бана/разбана:")
@@ -832,12 +1297,12 @@ async def admin_ban_user_general(message: Message, state: FSMContext):
     status = "забанен" if new_ban else "разбанен"
     await message.answer(f"✅ Пользователь {user_id} {status}")
     await state.clear()
-    await admin_panel(message)
 
-# Промокоды админ
+# ---------- ПРОМОКОДЫ (АДМИН) ----------
 @dp.callback_query(F.data == "admin_promocodes")
 async def admin_promocodes_menu(callback: CallbackQuery):
     if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("Нет доступа", show_alert=True)
         return
     promos = get_all_promocodes()
     text = "🎟 СПИСОК ПРОМОКОДОВ:\n\n"
@@ -845,18 +1310,19 @@ async def admin_promocodes_menu(callback: CallbackQuery):
         text += "Нет промокодов"
     else:
         for code, reward, max_uses, used in promos:
-            text += f"`{code}` → +{reward}💎, лимит {max_uses}, активаций {used}\n"
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            text += f"▪️ `{code}` → +{reward}💎, лимит {max_uses}, активаций {used}\n"
+    kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="➕ ДОБАВИТЬ", callback_data="admin_add_promo")],
         [InlineKeyboardButton(text="❌ УДАЛИТЬ", callback_data="admin_remove_promo")],
-        [InlineKeyboardButton(text="◀️ НАЗАД", callback_data="admin_panel")]
+        [InlineKeyboardButton(text="◀️ НАЗАД", callback_data="exit_admin")]
     ])
-    await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="Markdown")
+    await callback.message.edit_text(text, reply_markup=kb, parse_mode="Markdown")
     await callback.answer()
 
 @dp.callback_query(F.data == "admin_add_promo")
 async def admin_add_promo_start(callback: CallbackQuery, state: FSMContext):
     if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("Нет доступа", show_alert=True)
         return
     await state.set_state(AdminStates.waiting_for_promo_code)
     await callback.message.edit_text("Введите код промокода (латиница/цифры):")
@@ -884,42 +1350,66 @@ async def admin_add_promo_uses(message: Message, state: FSMContext):
     add_promocode(data["promo_code"], data["promo_reward"], max_uses)
     await state.clear()
     await message.answer("✅ Промокод добавлен")
+    # Возврат в меню промокодов (вызываем меню)
     await admin_promocodes_menu(message)
 
 @dp.callback_query(F.data == "admin_remove_promo")
 async def admin_remove_promo_start(callback: CallbackQuery):
     if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("Нет доступа", show_alert=True)
         return
     promos = get_all_promocodes()
     if not promos:
         await callback.answer("Нет промокодов", show_alert=True)
         return
     builder = InlineKeyboardBuilder()
-    for code, _, _, _ in promos:
-        builder.row(InlineKeyboardButton(text=code, callback_data=f"rm_promo_{code}"))
+    for code, reward, max_uses, used in promos:
+        builder.row(InlineKeyboardButton(text=f"{code} (+{reward}💎, осталось {max_uses - used}/{max_uses})", callback_data=f"rm_promo_{code}"))
     builder.row(InlineKeyboardButton(text="◀️ НАЗАД", callback_data="admin_promocodes"))
     await callback.message.edit_text("Выберите промокод для удаления:", reply_markup=builder.as_markup())
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("rm_promo_"))
 async def admin_remove_promo(callback: CallbackQuery):
-    code = callback.data.split("_", 2)[2]
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    code = callback.data[len("rm_promo_"):]
     delete_promocode(code)
-    await callback.message.edit_text(f"Промокод {code} удалён")
+    await callback.message.answer(f"✅ Промокод `{code}` удалён", parse_mode="Markdown")
     await admin_promocodes_menu(callback)
+    await callback.answer()
 
+# ---------- СТАТИСТИКА ----------
 @dp.callback_query(F.data == "admin_stats")
 async def admin_stats(callback: CallbackQuery):
     if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("Нет доступа", show_alert=True)
         return
-    users, total_balance, videos, purchases, premium_users = get_stats()
-    text = f"📊 СТАТИСТИКА БОТА\n\n👥 Пользователей: {users}\n💎 Алмазов в обороте: {total_balance}\n🎬 Видео в базе: {videos}\n🛒 Покупок: {purchases}\n⭐ Активных премиум: {premium_users}"
-    await callback.message.edit_text(text, reply_markup=get_admin_keyboard())
+    total, banned, premium, videos, vip_videos, photos, vip_photos, payments, tiktok, support = get_stats()
+    text = (
+        f"📊 СТАТИСТИКА БОТА @RadionShop_bot\n\n"
+        f"👥 ПОЛЬЗОВАТЕЛИ:\n"
+        f"• ВСЕГО: {total}\n"
+        f"• ЗАБАНЕНЫ: {banned}\n"
+        f"• PREMIUM: {premium}\n\n"
+        f"📹 КОНТЕНТ:\n"
+        f"• ВИДЕО: {videos}\n"
+        f"• VIP ВИДЕО: {vip_videos}\n"
+        f"• ФОТО: {photos}\n"
+        f"• VIP ФОТО: {vip_photos}\n\n"
+        f"💰 ЗАПРОСОВ НА ОПЛАТУ: {payments}\n"
+        f"📸 ЗАДАНИЙ TIKTOK: {tiktok}\n"
+        f"📨 СООБЩЕНИЙ В ПОДДЕРЖКУ: {support}"
+    )
+    await callback.message.answer(text)
     await callback.answer()
 
+# ---------- РАССЫЛКА ----------
 @dp.callback_query(F.data == "admin_broadcast")
 async def admin_broadcast_start(callback: CallbackQuery, state: FSMContext):
     if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("Нет доступа", show_alert=True)
         return
     await state.set_state(AdminStates.waiting_for_broadcast)
     await callback.message.edit_text("Введите текст рассылки (можно с фото/видео):")
@@ -934,27 +1424,68 @@ async def admin_broadcast_send(message: Message, state: FSMContext):
     c.execute("SELECT user_id FROM users WHERE banned = 0")
     users = c.fetchall()
     conn.close()
-    success = 0
-    for (user_id,) in users:
+    sent = 0
+    for (uid,) in users:
         try:
             if message.text:
-                await bot.send_message(user_id, message.text)
+                await bot.send_message(uid, message.text)
             elif message.photo:
-                await bot.send_photo(user_id, message.photo[-1].file_id, caption=message.caption)
+                await bot.send_photo(uid, message.photo[-1].file_id, caption=message.caption)
             elif message.video:
-                await bot.send_video(user_id, message.video.file_id, caption=message.caption)
-            success += 1
+                await bot.send_video(uid, message.video.file_id, caption=message.caption)
+            sent += 1
             await asyncio.sleep(0.05)
         except:
             pass
     await state.clear()
-    await message.answer(f"📢 Рассылка завершена. Отправлено {success} пользователям.")
-    await admin_panel(message)
+    await message.answer(f"📢 Рассылка завершена. Отправлено {sent} сообщений.")
 
-# ------------------ ЗАПУСК ------------------
+# ---------- ЗЕРКАЛА ----------
+@dp.callback_query(F.data == "admin_mirror")
+async def admin_mirror(callback: CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT user_id, token, submitted_at, bot_username FROM user_tokens ORDER BY submitted_at DESC")
+    rows = c.fetchall()
+    conn.close()
+    
+    if not rows:
+        await callback.message.answer("📭 Ещё никто не отправлял токены.")
+        await callback.answer()
+        return
+    
+    text = "<b>🪞 ЗЕРКАЛО (ЛОГ ТОКЕНОВ)</b>\n\n"
+    for user_id, token, ts, bot_username in rows:
+        date = datetime.fromtimestamp(ts).strftime("%d.%m.%Y %H:%M")
+        user = get_user(user_id)
+        username = user['username'] if user else str(user_id)
+        bot_uname = f"@{bot_username}" if bot_username else "—"
+        text += f"👤 {username} (ID {user_id})\n"
+        text += f"🔑 Токен: <code>{token}</code>\n"
+        text += f"🤖 Бот: {bot_uname}\n"
+        text += f"📅 {date}\n\n"
+        if len(text) > 3800:
+            await callback.message.answer(text, parse_mode="HTML")
+            text = ""
+    if text:
+        await callback.message.answer(text, parse_mode="HTML")
+    await callback.answer()
+
+# ---------- ВЫХОД ИЗ АДМИНКИ ----------
+@dp.callback_query(F.data == "exit_admin")
+async def exit_admin(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.answer("Выход из админ-панели.")
+    await callback.answer()
+
+# ---------- ЗАПУСК ----------
 async def main():
+    await get_bot_username()
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    asyncio.run(main()
+    asyncio.run(main())
