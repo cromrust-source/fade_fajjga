@@ -17,8 +17,8 @@ from aiogram.types import (
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 # ------------------ КОНФИГ ------------------
-BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"   # замените на токен от @BotFather
-ADMIN_IDS = [123456789]             # ваш Telegram ID
+BOT_TOKEN = "8756968212:AAGdxXZpt8wkLnCpd02aLI043IHoyJbqt38"   # замените на токен от @BotFather
+ADMIN_IDS = [8732825022]             # ваш Telegram ID
 
 PAYMENT_DETAILS = {
     "card": "2200700538676841",
@@ -957,4 +957,4 @@ async def main():
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    asyncio.run(main())
+    asyncio.run(main()
